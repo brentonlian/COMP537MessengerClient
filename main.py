@@ -391,3 +391,131 @@ else:
 
 
 print("Testing complete")
+
+print("Testing Step 9: initial key retirement")
+
+fs_alice = MessengerClient("fs_alice", server_sign_pk, server_enc_pk)
+fs_bob = MessengerClient("fs_bob", server_sign_pk, server_enc_pk)
+
+cert_fs_a = fs_alice.generateCertificate()
+cert_fs_b = fs_bob.generateCertificate()
+
+fs_alice.receiveCertificate(cert_fs_b, server.signCert(cert_fs_b))
+fs_bob.receiveCertificate(cert_fs_a, server.signCert(cert_fs_a))
+
+# Enable automatic key retirement.
+fs_alice.sealKnownPeers()
+fs_bob.sealKnownPeers()
+
+# Alice sends the first message.
+h, ct = fs_alice.sendMessage("fs_bob", "Hello Bob!")
+
+assert fs_bob.receiveMessage("fs_alice", h, ct) == "Hello Bob!"
+
+# Bob has already replaced his initial DH key.
+assert fs_bob.initial_dh_sk is None
+
+# Alice still needs her initial key to receive Bob's first reply.
+assert fs_alice.initial_dh_sk is not None
+
+# Bob replies.
+h, ct = fs_bob.sendMessage("fs_alice", "Hello Alice!")
+
+assert fs_alice.receiveMessage("fs_bob", h, ct) == "Hello Alice!"
+
+# Alice should now have retired her initial key.
+assert fs_alice.initial_dh_sk is None
+assert fs_bob.initial_dh_sk is None
+
+# Verify communication continues normally.
+h, ct = fs_alice.sendMessage("fs_bob", "Still secure!")
+
+assert fs_bob.receiveMessage("fs_alice", h, ct) == "Still secure!"
+
+h, ct = fs_bob.sendMessage("fs_alice", "Yes!")
+
+assert fs_alice.receiveMessage("fs_bob", h, ct) == "Yes!"
+
+print("Step 9 key-retirement tests passed!")
+
+print("Testing Step 10: break-in recovery")
+
+from messenger import _kdf_root, _kdf_chain, _header_aad
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.exceptions import InvalidTag
+
+rec_a = MessengerClient("rec_a", server_sign_pk, server_enc_pk)
+rec_b = MessengerClient("rec_b", server_sign_pk, server_enc_pk)
+
+rec_ca = rec_a.generateCertificate()
+rec_cb = rec_b.generateCertificate()
+
+rec_a.receiveCertificate(rec_cb, server.signCert(rec_cb))
+rec_b.receiveCertificate(rec_ca, server.signCert(rec_ca))
+
+rec_a.sealKnownPeers()
+rec_b.sealKnownPeers()
+
+# Establish a ratcheted conversation.
+h, c = rec_a.sendMessage("rec_b", "First")
+assert rec_b.receiveMessage("rec_a", h, c) == "First"
+
+h, c = rec_b.sendMessage("rec_a", "Second")
+assert rec_a.receiveMessage("rec_b", h, c) == "Second"
+
+old_header, c = rec_a.sendMessage("rec_b", "Third")
+assert rec_b.receiveMessage("rec_a", old_header, c) == "Third"
+
+assert rec_a.initial_dh_sk is None
+assert rec_b.initial_dh_sk is None
+
+# Simulate an attacker compromising Alice's current state.
+stolen_private = rec_a.conns["rec_b"]["DHs"]
+stolen_root = rec_a.conns["rec_b"]["RK"]
+
+# Bob sends another message with a fresh DH key.
+h4, c4 = rec_b.sendMessage("rec_a", "Still compromised")
+
+peer_pk = ec.EllipticCurvePublicKey.from_encoded_point(
+    ec.SECP256R1(), bytes.fromhex(h4["dh"])
+)
+
+shared = stolen_private.exchange(ec.ECDH(), peer_pk)
+recv_root, recv_ck = _kdf_root(stolen_root, shared)
+_, attacker_msg_key = _kdf_chain(recv_ck)
+
+# The attacker can still decrypt Bob's message.
+attacker_plaintext = AESGCM(attacker_msg_key).decrypt(
+    bytes.fromhex(h4["nonce"]),
+    c4,
+    _header_aad("rec_b", "rec_a", h4),
+)
+
+assert attacker_plaintext.decode("utf-8") == "Still compromised"
+assert rec_a.receiveMessage("rec_b", h4, c4) == "Still compromised"
+
+# Alice generates a fresh DH key after the compromise.
+h5, c5 = rec_a.sendMessage("rec_b", "Recovered")
+
+assert h5["dh"] != old_header["dh"]
+assert rec_b.receiveMessage("rec_a", h5, c5) == "Recovered"
+
+# Attempt to derive Alice's new sending key using her stolen old key.
+_, wrong_ck = _kdf_root(
+    recv_root,
+    stolen_private.exchange(ec.ECDH(), peer_pk),
+)
+_, wrong_msg_key = _kdf_chain(wrong_ck)
+
+try:
+    AESGCM(wrong_msg_key).decrypt(
+        bytes.fromhex(h5["nonce"]),
+        c5,
+        _header_aad("rec_a", "rec_b", h5),
+    )
+except InvalidTag:
+    print("Old compromised key cannot decrypt recovered message!")
+else:
+    error("Recovered message decrypted using the old key")
+
+print("Step 10 break-in recovery tests passed!")
