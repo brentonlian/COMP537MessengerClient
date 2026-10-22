@@ -4,6 +4,7 @@ import string
 import json
 
 from cryptography.hazmat.primitives import hashes, serialization, hmac
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -173,8 +174,90 @@ class MessengerClient:
         return header, ciphertext
 
     def receiveMessage(self, name, header, ciphertext):
-        raise Exception("not implemented!")
-        return
+        # Validate the header and ciphertext.
+        if (not isinstance(header, dict)
+                or set(header) != {"dh", "pn", "n", "nonce"}
+                or not isinstance(header["dh"], str)
+                or not isinstance(header["nonce"], str)
+                or type(header["n"]) is not int or header["n"] < 0
+                or type(header["pn"]) is not int or header["pn"] < 0
+                or not isinstance(ciphertext, bytes) or len(ciphertext) < 16):
+            return None
+
+        try:
+            incoming_dh = bytes.fromhex(header["dh"])
+            nonce = bytes.fromhex(header["nonce"])
+
+            if len(incoming_dh) != 65 or len(nonce) != 12:
+                return None
+
+            state = self._initialize_session(name, False)
+
+            # Reject dropped, replayed, or out-of-order messages.
+            if header["n"] != state["Nr"]:
+                return None
+
+            first_receive = state["DHr"] is None
+
+            if first_receive:
+                expected_dh = self.certs[name]
+                expected_bytes = expected_dh.public_bytes(
+                    encoding=serialization.Encoding.X962,
+                    format=serialization.PublicFormat.UncompressedPoint,
+                )
+
+                if incoming_dh != expected_bytes or header["pn"] != 0:
+                    return None
+
+                new_root, input_ck = _kdf_root(
+                    state["RK"], state["RK"]
+                )
+
+            else:
+                expected_bytes = state["DHr"].public_bytes(
+                    encoding=serialization.Encoding.X962,
+                    format=serialization.PublicFormat.UncompressedPoint,
+                )
+
+                if incoming_dh != expected_bytes or state["CKr"] is None:
+                    return None
+
+                new_root, input_ck = None, state["CKr"]
+
+            # Derive the receiving message key.
+            next_ck, msg_key = _kdf_chain(input_ck)
+
+            # Authenticate and decrypt the message.
+            plaintext = AESGCM(msg_key).decrypt(
+                nonce,
+                ciphertext,
+                _header_aad(name, self.name, header),
+            ).decode("utf-8")
+
+            # Update state only after successful authentication.
+            if first_receive:
+                state["RK"] = new_root
+                state["DHr"] = expected_dh
+                state["PN"] = state["Ns"]
+                state["Ns"] = 0
+
+                # Prepare a new sending chain for the reply.
+                new_private_key = ec.generate_private_key(ec.SECP256R1())
+
+                state["RK"], state["CKs"] = _kdf_root(
+                    state["RK"],
+                    new_private_key.exchange(ec.ECDH(), expected_dh),
+                )
+
+                state["DHs"] = new_private_key
+
+            state["CKr"] = next_ck
+            state["Nr"] += 1
+
+            return plaintext
+
+        except (InvalidTag, ValueError, TypeError, KeyError):
+            return None
 
     def report(self, name, message):
         # Encode the sender name and reported message.
