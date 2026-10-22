@@ -2,7 +2,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric import ec
 
 # Increase as we implement more methods: 1=certificates, 2=reporting, 3=messaging.
-TEST_STAGE = 1
+TEST_STAGE = 3
 
 from messenger import MessengerServer
 from messenger import MessengerClient
@@ -95,8 +95,64 @@ if decryptedReport != reportPT:
 else:
     print("Reporting test successful!")
 
+print("Testing tampered report ciphertext")
+
+tampered = bytearray(reportCT)
+tampered[-1] ^= 1
+
+try:
+    server.decryptReport(bytes(tampered))
+except Exception:
+    print("successfully rejected tampered report!")
+else:
+    error("accepted tampered report")
+
+
+print("Testing randomized report encryption")
+
+_, reportCT2 = alice.report("Bob", content)
+
+assert reportCT != reportCT2
+assert server.decryptReport(reportCT2) == reportPT
+
+print("randomized encryption test passed!")
+
 if TEST_STAGE == 2:
     print("Step 2 complete: reporting tests passed!")
+    raise SystemExit(0)
+
+print("Testing session initialization")
+
+a = alice._initialize_session("bob", True)
+b = bob._initialize_session("alice", False)
+
+shared_a = alice.initial_dh_sk.exchange(
+    ec.ECDH(), alice.certs["bob"]
+)
+shared_b = bob.initial_dh_sk.exchange(
+    ec.ECDH(), bob.certs["alice"]
+)
+
+assert shared_a == shared_b
+assert b["RK"] == shared_a
+
+from messenger import _kdf_root
+
+expected_rk, expected_ck = _kdf_root(shared_a, shared_a)
+
+assert a["RK"] == expected_rk
+assert a["CKs"] == expected_ck
+assert a["CKr"] is None
+assert b["CKs"] is None
+assert b["CKr"] is None
+
+assert a["Ns"] == 0
+assert a["Nr"] == 0
+assert a["PN"] == 0
+
+print("Step 3 session initialization tests passed!")
+
+if TEST_STAGE == 3:
     raise SystemExit(0)
 
 print("Testing a conversation")
