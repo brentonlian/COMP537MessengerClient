@@ -1,4 +1,8 @@
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric import ec
+
+# Increase as we implement more methods: 1=certificates, 2=reporting, 3=messaging.
+TEST_STAGE = 1
 
 from messenger import MessengerServer
 from messenger import MessengerClient
@@ -50,6 +54,36 @@ except:
 else:
     error("accepted certificate with incorrect signature")
 
+# Additional certificate security tests (Step 1).
+print("Testing certificate authenticity and stored public keys")
+assert alice.certs["bob"].public_numbers() == bob.initial_dh_sk.public_key().public_numbers()
+assert "mallory" not in alice.certs
+
+# Tampering with the signed username must invalidate the signature.
+tampered_name = certB.copy()
+tampered_name["name"] = "eve"
+try:
+    alice.receiveCertificate(tampered_name, sigB)
+except InvalidSignature:
+    print("successfully rejected tampered username!")
+else:
+    error("accepted a certificate with a tampered username")
+assert "eve" not in alice.certs
+
+# Replacing Bob's signed public key with Carol's valid key must also be rejected.
+tampered_key = certB.copy()
+tampered_key["public_key"] = certC["public_key"]
+try:
+    alice.receiveCertificate(tampered_key, sigB)
+except InvalidSignature:
+    print("successfully rejected tampered public key!")
+else:
+    error("accepted a certificate with a tampered public key")
+
+if TEST_STAGE == 1:
+    print("Step 1 complete: certificate tests passed!")
+    raise SystemExit(0)
+
 print("Testing Reporting")
 content = "inappropriate message contents"
 reportPT, reportCT = alice.report("Bob", content)
@@ -60,6 +94,10 @@ if decryptedReport != reportPT:
     print(decryptedReport)
 else:
     print("Reporting test successful!")
+
+if TEST_STAGE == 2:
+    print("Step 2 complete: reporting tests passed!")
+    raise SystemExit(0)
 
 print("Testing a conversation")
 header, ct = alice.sendMessage("bob", "Hi Bob!")
