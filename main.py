@@ -2,7 +2,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric import ec
 
 # Increase as we implement more methods: 1=certificates, 2=reporting, 3=messaging.
-TEST_STAGE = 5
+TEST_STAGE = 7
 
 from messenger import MessengerServer
 from messenger import MessengerClient
@@ -287,6 +287,58 @@ print("Tampered ciphertext rejected successfully!")
 print("Step 5 receiving chain tests passed!")
 
 if TEST_STAGE == 5:
+    raise SystemExit(0)
+
+print("Testing Step 6: two-way DH ratcheting")
+
+chat_a = MessengerClient("chat_a", server_sign_pk, server_enc_pk)
+chat_b = MessengerClient("chat_b", server_sign_pk, server_enc_pk)
+
+cert_a = chat_a.generateCertificate()
+cert_b = chat_b.generateCertificate()
+
+chat_a.receiveCertificate(cert_b, server.signCert(cert_b))
+chat_b.receiveCertificate(cert_a, server.signCert(cert_a))
+
+# Alice sends two messages.
+h1, c1 = chat_a.sendMessage("chat_b", "First")
+assert chat_b.receiveMessage("chat_a", h1, c1) == "First"
+
+h2, c2 = chat_a.sendMessage("chat_b", "Second")
+assert chat_b.receiveMessage("chat_a", h2, c2) == "Second"
+
+# Bob replies with a new DH public key.
+h3, c3 = chat_b.sendMessage("chat_a", "Reply 1")
+assert h3["n"] == 0
+assert chat_a.receiveMessage("chat_b", h3, c3) == "Reply 1"
+
+# Bob continues the same sending chain.
+h4, c4 = chat_b.sendMessage("chat_a", "Reply 2")
+assert chat_a.receiveMessage("chat_b", h4, c4) == "Reply 2"
+
+# Alice replies, triggering another DH ratchet.
+h5, c5 = chat_a.sendMessage("chat_b", "Reply back")
+assert h5["pn"] == 2
+assert h5["n"] == 0
+assert chat_b.receiveMessage("chat_a", h5, c5) == "Reply back"
+
+# Tamper with a new ratchet header.
+h6, c6 = chat_b.sendMessage("chat_a", "Another reply")
+
+before = chat_a.conns["chat_b"].copy()
+
+bad_header = dict(h6)
+bad_header["dh"] = h5["dh"]
+
+assert chat_a.receiveMessage("chat_b", bad_header, c6) is None
+assert chat_a.conns["chat_b"] == before
+
+# A failed message must not prevent legitimate decryption.
+assert chat_a.receiveMessage("chat_b", h6, c6) == "Another reply"
+
+print("Step 6 DH ratchet tests passed!")
+
+if TEST_STAGE == 6:
     raise SystemExit(0)
 
 print("Testing a conversation")

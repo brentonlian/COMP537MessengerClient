@@ -18,8 +18,10 @@ def _certificate_bytes(certificate):
             or not isinstance(certificate["public_key"], str)):
         raise ValueError("Malformed certificate")
 
-    return json.dumps(certificate, sort_keys=True,
-                      separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return json.dumps(
+        certificate, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
 
 class MessengerServer:
     def __init__(self, server_signing_key, server_decryption_key):
@@ -61,6 +63,7 @@ class MessengerServer:
         return self.server_signing_key.sign(
             _certificate_bytes(cert), ec.ECDSA(hashes.SHA256())
         )
+
 
 class MessengerClient:
 
@@ -193,20 +196,21 @@ class MessengerClient:
 
             state = self._initialize_session(name, False)
 
-            # Reject dropped, replayed, or out-of-order messages.
-            if header["n"] != state["Nr"]:
-                return None
-
             first_receive = state["DHr"] is None
+            peer_changed = False
+            peer_pk = None
 
             if first_receive:
-                expected_dh = self.certs[name]
-                expected_bytes = expected_dh.public_bytes(
+                # First message uses the sender's certified DH key.
+                peer_pk = self.certs[name]
+                expected_dh = peer_pk.public_bytes(
                     encoding=serialization.Encoding.X962,
                     format=serialization.PublicFormat.UncompressedPoint,
                 )
 
-                if incoming_dh != expected_bytes or header["pn"] != 0:
+                if (incoming_dh != expected_dh
+                        or header["pn"] != 0
+                        or header["n"] != 0):
                     return None
 
                 new_root, input_ck = _kdf_root(
@@ -214,17 +218,39 @@ class MessengerClient:
                 )
 
             else:
-                expected_bytes = state["DHr"].public_bytes(
+                old_dh = state["DHr"].public_bytes(
                     encoding=serialization.Encoding.X962,
                     format=serialization.PublicFormat.UncompressedPoint,
                 )
 
-                if incoming_dh != expected_bytes or state["CKr"] is None:
-                    return None
+                if incoming_dh == old_dh:
+                    # Continue the existing receiving chain.
+                    if (header["n"] != state["Nr"]
+                            or state["CKr"] is None):
+                        return None
 
-                new_root, input_ck = None, state["CKr"]
+                    new_root = None
+                    input_ck = state["CKr"]
 
-            # Derive the receiving message key.
+                else:
+                    # New peer DH key: start a new receiving chain.
+                    # No skipped messages are allowed.
+                    if (header["pn"] != state["Nr"]
+                            or header["n"] != 0):
+                        return None
+
+                    peer_pk = ec.EllipticCurvePublicKey.from_encoded_point(
+                        ec.SECP256R1(), incoming_dh
+                    )
+
+                    new_root, input_ck = _kdf_root(
+                        state["RK"],
+                        state["DHs"].exchange(ec.ECDH(), peer_pk)
+                    )
+
+                    peer_changed = True
+
+            # Derive the next receiving chain key and message key.
             next_ck, msg_key = _kdf_chain(input_ck)
 
             # Authenticate and decrypt the message.
@@ -234,22 +260,24 @@ class MessengerClient:
                 _header_aad(name, self.name, header),
             ).decode("utf-8")
 
-            # Update state only after successful authentication.
-            if first_receive:
-                state["RK"] = new_root
-                state["DHr"] = expected_dh
-                state["PN"] = state["Ns"]
-                state["Ns"] = 0
+            # Commit changes only after successful authentication.
+            if first_receive or peer_changed:
+                new_private = ec.generate_private_key(ec.SECP256R1())
 
-                # Prepare a new sending chain for the reply.
-                new_private_key = ec.generate_private_key(ec.SECP256R1())
-
-                state["RK"], state["CKs"] = _kdf_root(
-                    state["RK"],
-                    new_private_key.exchange(ec.ECDH(), expected_dh),
+                next_root, next_send_ck = _kdf_root(
+                    new_root,
+                    new_private.exchange(ec.ECDH(), peer_pk)
                 )
 
-                state["DHs"] = new_private_key
+                state["PN"] = state["Ns"]
+                state["Ns"] = 0
+                state["Nr"] = 0
+
+                state["DHr"] = peer_pk
+                state["DHs"] = new_private
+
+                state["RK"] = next_root
+                state["CKs"] = next_send_ck
 
             state["CKr"] = next_ck
             state["Nr"] += 1
@@ -295,15 +323,17 @@ class MessengerClient:
         # Include everything necessary for server decryption.
         return plaintext.decode("utf-8"), ephemeral_pk + nonce + ciphertext
 
+
 def _kdf_root(root_key, dh_output):
     output = HKDF(
         algorithm=hashes.SHA256(),
         length=64,
         salt=root_key,
         info=b"COMP537-double-ratchet-root-v1",
-        ).derive(dh_output)
+    ).derive(dh_output)
 
     return output[:32], output[32:]
+
 
 def _kdf_chain(chain_key):
     if chain_key is None:
@@ -320,6 +350,7 @@ def _kdf_chain(chain_key):
     next_chain_key = h.finalize()
 
     return next_chain_key, message_key
+
 
 def _header_aad(sender, recipient, header):
     return json.dumps(
