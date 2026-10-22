@@ -75,8 +75,12 @@ class MessengerClient:
         self.certs = {}
         self.initial_dh_sk = None
         self.certificate = None
+        self._sealed_peers = False
 
     def generateCertificate(self):
+        # Preserve the original certificate after key retirement.
+        if self.certificate is not None:
+            return dict(self.certificate)
         # Generate the client's initial P-256 DH key pair once.
         if self.initial_dh_sk is None:
             self.initial_dh_sk = ec.generate_private_key(ec.SECP256R1())
@@ -99,7 +103,43 @@ class MessengerClient:
         peer_pk = ec.EllipticCurvePublicKey.from_encoded_point(
             ec.SECP256R1(), bytes.fromhex(certificate["public_key"])
         )
+        existing = self.certs.get(certificate["name"])
+
+        if self._sealed_peers and existing is None:
+            raise ValueError("Peer roster sealed; cannot add new contacts")
+
+        if existing is not None and existing.public_numbers() != peer_pk.public_numbers():
+            raise ValueError("Conflicting certificate for an existing contact")
+
         self.certs[certificate["name"]] = peer_pk
+
+    def sealKnownPeers(self):
+        """Prevent new contacts and enable initial key retirement."""
+        if not self.certs:
+            raise ValueError("Receive peer certificates before sealing")
+
+        self._sealed_peers = True
+        self._retire_if_possible()
+
+
+    def _retire_if_possible(self):
+        """Discard the initial DH key after all known sessions rekey."""
+        if not self._sealed_peers or self.initial_dh_sk is None:
+            return
+
+        # Every known contact must have an established session.
+        if set(self.certs) != set(self.conns):
+            return
+
+        for state in self.conns.values():
+            # Do not retire while any session still uses the initial key.
+            if (state["DHs"] is self.initial_dh_sk
+                    or state["CKs"] is None
+                    or state["CKr"] is None):
+                return
+
+        # No active session needs the original private key.
+        self.initial_dh_sk = None
 
     def _initialize_session(self, name, initiator):
         if name in self.conns:
@@ -281,6 +321,9 @@ class MessengerClient:
 
             state["CKr"] = next_ck
             state["Nr"] += 1
+
+            # Retire the initial private key when all sessions have rekeyed.
+            self._retire_if_possible()
 
             return plaintext
 
