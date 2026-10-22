@@ -2,7 +2,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric import ec
 
 # Increase as we implement more methods: 1=certificates, 2=reporting, 3=messaging.
-TEST_STAGE = 3
+TEST_STAGE = 4
 
 from messenger import MessengerServer
 from messenger import MessengerClient
@@ -153,6 +153,50 @@ assert a["PN"] == 0
 print("Step 3 session initialization tests passed!")
 
 if TEST_STAGE == 3:
+    raise SystemExit(0)
+
+print("Testing sending ratchet")
+
+from messenger import _kdf_chain, _header_aad
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+# Use separate test users so the original conversation
+# is unaffected when we implement receiving later.
+sender = MessengerClient("sender", server_sign_pk, server_enc_pk)
+receiver = MessengerClient("receiver", server_sign_pk, server_enc_pk)
+
+sender.generateCertificate()
+receiver_cert = receiver.generateCertificate()
+receiver_sig = server.signCert(receiver_cert)
+
+sender.receiveCertificate(receiver_cert, receiver_sig)
+
+state = sender._initialize_session("receiver", True)
+old_ck = state["CKs"]
+
+header, ciphertext = sender.sendMessage("receiver", "Hello!")
+
+# Verify message numbering and sending-chain advancement.
+assert header["n"] == 0
+assert header["pn"] == 0
+assert state["Ns"] == 1
+
+expected_ck, message_key = _kdf_chain(old_ck)
+assert state["CKs"] == expected_ck
+assert state["CKs"] != old_ck
+
+# Independently verify that the derived key decrypts the message.
+plaintext = AESGCM(message_key).decrypt(
+    bytes.fromhex(header["nonce"]),
+    ciphertext,
+    _header_aad("sender", "receiver", header),
+)
+
+assert plaintext.decode("utf-8") == "Hello!"
+
+print("Step 4 sending ratchet tests passed!")
+
+if TEST_STAGE == 4:
     raise SystemExit(0)
 
 print("Testing a conversation")

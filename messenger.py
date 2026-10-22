@@ -3,7 +3,7 @@ import pickle
 import string
 import json
 
-from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives import hashes, serialization, hmac
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -135,8 +135,42 @@ class MessengerClient:
         return state
 
     def sendMessage(self, name, message):
-        raise Exception("not implemented!")
-        return
+        # Initialize a session if this is the first message.
+        state = self._initialize_session(name, True)
+
+        if state["CKs"] is None:
+            raise ValueError("Sending chain not initialized")
+
+        # Derive a fresh message key and next chain key.
+        next_ck, message_key = _kdf_chain(state["CKs"])
+
+        # Construct the message header.
+        public_key = state["DHs"].public_key().public_bytes(
+            encoding=serialization.Encoding.X962,
+            format=serialization.PublicFormat.UncompressedPoint,
+        )
+
+        nonce = os.urandom(12)
+
+        header = {
+            "dh": public_key.hex(),
+            "pn": state["PN"],
+            "n": state["Ns"],
+            "nonce": nonce.hex(),
+        }
+
+        # Encrypt the message and authenticate its header.
+        ciphertext = AESGCM(message_key).encrypt(
+            nonce,
+            message.encode("utf-8"),
+            _header_aad(self.name, name, header),
+        )
+
+        # Advance the sending ratchet only after encryption succeeds.
+        state["CKs"] = next_ck
+        state["Ns"] += 1
+
+        return header, ciphertext
 
     def receiveMessage(self, name, header, ciphertext):
         raise Exception("not implemented!")
@@ -187,3 +221,31 @@ def _kdf_root(root_key, dh_output):
         ).derive(dh_output)
 
     return output[:32], output[32:]
+
+def _kdf_chain(chain_key):
+    if chain_key is None:
+        raise ValueError("Sending chain not initialized")
+
+    # Derive the one-time message key.
+    h = hmac.HMAC(chain_key, hashes.SHA256())
+    h.update(b"\x01")
+    message_key = h.finalize()
+
+    # Derive the next chain key.
+    h = hmac.HMAC(chain_key, hashes.SHA256())
+    h.update(b"\x02")
+    next_chain_key = h.finalize()
+
+    return next_chain_key, message_key
+
+def _header_aad(sender, recipient, header):
+    return json.dumps(
+        {
+            "sender": sender,
+            "recipient": recipient,
+            "header": header,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
