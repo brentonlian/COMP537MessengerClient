@@ -1,7 +1,7 @@
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric import ec
 
-# Increase as we implement more methods: 1=certificates, 2=reporting, 3=messaging.
+# Increase as we implement more methods:
 TEST_STAGE = 7
 
 from messenger import MessengerServer
@@ -160,8 +160,7 @@ print("Testing sending ratchet")
 from messenger import _kdf_chain, _header_aad
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-# Use separate test users so the original conversation
-# is unaffected when we implement receiving later.
+# Use separate test users so the original conversation is unaffected when we implement receiving later.
 sender = MessengerClient("sender", server_sign_pk, server_enc_pk)
 receiver = MessengerClient("receiver", server_sign_pk, server_enc_pk)
 

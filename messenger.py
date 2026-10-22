@@ -114,7 +114,7 @@ class MessengerClient:
         self.certs[certificate["name"]] = peer_pk
 
     def sealKnownPeers(self):
-        """Prevent new contacts and enable initial key retirement."""
+        #Prevent new contacts and enable initial key retirement.
         if not self.certs:
             raise ValueError("Receive peer certificates before sealing")
 
@@ -123,7 +123,7 @@ class MessengerClient:
 
 
     def _retire_if_possible(self):
-        """Discard the initial DH key after all known sessions rekey."""
+        #Discard the initial DH key after all known sessions rekey.
         if not self._sealed_peers or self.initial_dh_sk is None:
             return
 
