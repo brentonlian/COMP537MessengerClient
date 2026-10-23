@@ -1,14 +1,32 @@
 #Brenton Lian, Akksharvan Senthilkumar
 import os
-import pickle
-import string
 import json
+from typing import Optional, TypedDict
 
 from cryptography.hazmat.primitives import hashes, serialization, hmac
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+
+class SessionState(TypedDict):
+    RK: bytes
+    DHs: ec.EllipticCurvePrivateKey
+    DHr: Optional[ec.EllipticCurvePublicKey]
+    CKs: Optional[bytes]
+    CKr: Optional[bytes]
+    Ns: int
+    Nr: int
+    PN: int
+
+
+class MessageHeader(TypedDict):
+    dh: str
+    pn: int
+    n: int
+    nonce: str
+
 
 def _certificate_bytes(certificate):
     """Deterministically encode the two certificate fields for signing."""
@@ -72,28 +90,27 @@ class MessengerClient:
         self.name = name
         self.server_signing_pk = server_signing_pk
         self.server_encryption_pk = server_encryption_pk
-        self.conns = {}
-        self.certs = {}
-        self.initial_dh_sk = None
-        self.certificate = None
+        self.conns: dict[str, SessionState] = {}
+        self.certs: dict[str, ec.EllipticCurvePublicKey] = {}
+        self.initial_dh_sk: Optional[ec.EllipticCurvePrivateKey] = None
+        self.certificate: Optional[dict[str, str]] = None
         self._sealed_peers = False
 
-    def generateCertificate(self):
+    def generateCertificate(self) -> dict[str, str]:
         # Preserve the original certificate after key retirement.
         if self.certificate is not None:
             return dict(self.certificate)
-        # Generate the client's initial P-256 DH key pair once.
-        if self.initial_dh_sk is None:
-            self.initial_dh_sk = ec.generate_private_key(ec.SECP256R1())
-            public_key_bytes = self.initial_dh_sk.public_key().public_bytes(
-                encoding=serialization.Encoding.X962,
-                format=serialization.PublicFormat.UncompressedPoint,
-            )
-            self.certificate = {
-                "name": self.name,
-                "public_key": public_key_bytes.hex(),
-            }
-        return dict(self.certificate)
+        # Generate the certificate and key together, exactly once.
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        public_key_bytes = private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.X962,
+            format=serialization.PublicFormat.UncompressedPoint,
+        )
+        certificate = {"name": self.name, "public_key": public_key_bytes.hex()}
+        _certificate_bytes(certificate)
+        self.initial_dh_sk = private_key
+        self.certificate = certificate
+        return dict(certificate)
 
     def receiveCertificate(self, certificate, signature):
         # Do not trust or store the certificate until its server signature verifies.
@@ -142,9 +159,13 @@ class MessengerClient:
         # No active session needs the original private key.
         self.initial_dh_sk = None
 
-    def _initialize_session(self, name, initiator):
-        if name in self.conns:
-            return self.conns[name]
+    def _initialize_session(self, name, initiator) -> SessionState:
+        if name not in self.conns:
+            self.conns[name] = self._new_session(name, initiator)
+        return self.conns[name]
+
+    def _new_session(self, name, initiator) -> SessionState:
+        """Build tentative state without committing an unauthenticated session."""
 
         if self.initial_dh_sk is None:
             raise ValueError("Generate your certificate first")
@@ -158,7 +179,7 @@ class MessengerClient:
             ec.ECDH(), peer_pk
         )
 
-        state = {
+        state: SessionState = {
             "RK": initial_secret,
             "DHs": self.initial_dh_sk,
             "DHr": None,
@@ -176,12 +197,16 @@ class MessengerClient:
                 initial_secret, initial_secret
             )
 
-        self.conns[name] = state
         return state
 
     def sendMessage(self, name, message):
-        # Initialize a session if this is the first message.
-        state = self._initialize_session(name, True)
+        # Validate plaintext before creating or advancing any session state.
+        if not isinstance(message, str):
+            raise TypeError("Message must be a string")
+        plaintext = message.encode("utf-8")
+        state = self.conns.get(name)
+        if state is None:
+            state = self._new_session(name, True)
 
         if state["CKs"] is None:
             raise ValueError("Sending chain not initialized")
@@ -197,7 +222,7 @@ class MessengerClient:
 
         nonce = os.urandom(12)
 
-        header = {
+        header: MessageHeader = {
             "dh": public_key.hex(),
             "pn": state["PN"],
             "n": state["Ns"],
@@ -207,13 +232,14 @@ class MessengerClient:
         # Encrypt the message and authenticate its header.
         ciphertext = AESGCM(message_key).encrypt(
             nonce,
-            message.encode("utf-8"),
+            plaintext,
             _header_aad(self.name, name, header),
         )
 
         # Advance the sending ratchet only after encryption succeeds.
         state["CKs"] = next_ck
         state["Ns"] += 1
+        self.conns[name] = state
 
         return header, ciphertext
 
@@ -235,7 +261,8 @@ class MessengerClient:
             if len(incoming_dh) != 65 or len(nonce) != 12:
                 return None
 
-            state = self._initialize_session(name, False)
+            existing = self.conns.get(name)
+            state = existing.copy() if existing is not None else self._new_session(name, False)
 
             first_receive = state["DHr"] is None
             peer_changed = False
@@ -259,7 +286,10 @@ class MessengerClient:
                 )
 
             else:
-                old_dh = state["DHr"].public_bytes(
+                previous_peer = state["DHr"]
+                if previous_peer is None:
+                    return None
+                old_dh = previous_peer.public_bytes(
                     encoding=serialization.Encoding.X962,
                     format=serialization.PublicFormat.UncompressedPoint,
                 )
@@ -303,6 +333,8 @@ class MessengerClient:
 
             # Commit changes only after successful authentication.
             if first_receive or peer_changed:
+                if peer_pk is None or new_root is None:
+                    return None
                 new_private = ec.generate_private_key(ec.SECP256R1())
 
                 next_root, next_send_ck = _kdf_root(
@@ -322,6 +354,12 @@ class MessengerClient:
 
             state["CKr"] = next_ck
             state["Nr"] += 1
+
+            # Commit only after the complete authenticated transition succeeds.
+            if existing is None:
+                self.conns[name] = state
+            else:
+                existing.update(state)
 
             # Retire the initial private key when all sessions have rekeyed.
             self._retire_if_possible()
@@ -368,7 +406,7 @@ class MessengerClient:
         return plaintext.decode("utf-8"), ephemeral_pk + nonce + ciphertext
 
 
-def _kdf_root(root_key, dh_output):
+def _kdf_root(root_key: bytes, dh_output: bytes) -> tuple[bytes, bytes]:
     output = HKDF(
         algorithm=hashes.SHA256(),
         length=64,
@@ -379,7 +417,7 @@ def _kdf_root(root_key, dh_output):
     return output[:32], output[32:]
 
 
-def _kdf_chain(chain_key):
+def _kdf_chain(chain_key: Optional[bytes]) -> tuple[bytes, bytes]:
     if chain_key is None:
         raise ValueError("Sending chain not initialized")
 

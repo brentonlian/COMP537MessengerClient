@@ -1,5 +1,5 @@
 #Brenton Lian, Akksharvan Senthilkumar
-from cryptography.exceptions import InvalidSignature
+from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives.asymmetric import ec
 
 # Increase as we implement more methods:
@@ -9,7 +9,7 @@ from messenger import MessengerServer
 from messenger import MessengerClient
 
 def error(s):
-  print("=== ERROR: " + s)
+  raise AssertionError(s)
 
 print("Initializing Server")
 server_sign_sk = ec.generate_private_key(ec.SECP256R1())
@@ -42,21 +42,22 @@ try:
     bob.receiveCertificate(certC, sigC)
     carol.receiveCertificate(certA, sigA)
     carol.receiveCertificate(certB, sigB)
-except:
-    error("certificate verification issue")
+except (InvalidSignature, ValueError) as exc:
+    raise AssertionError("certificate verification issue") from exc
 
 print("Testing incorrect cert issuance")
 mallory = MessengerClient("mallory", server_sign_pk, server_enc_pk)
 certM = mallory.generateCertificate()
 try:
     alice.receiveCertificate(certM, sigC)
-except:
+except InvalidSignature:
     print("successfully detected bad signature!")
 else:
     error("accepted certificate with incorrect signature")
 
 # Additional certificate security tests (Step 1).
 print("Testing certificate authenticity and stored public keys")
+assert bob.initial_dh_sk is not None
 assert alice.certs["bob"].public_numbers() == bob.initial_dh_sk.public_key().public_numbers()
 assert "mallory" not in alice.certs
 
@@ -103,7 +104,7 @@ tampered[-1] ^= 1
 
 try:
     server.decryptReport(bytes(tampered))
-except Exception:
+except InvalidTag:
     print("successfully rejected tampered report!")
 else:
     error("accepted tampered report")
@@ -127,6 +128,8 @@ print("Testing session initialization")
 a = alice._initialize_session("bob", True)
 b = bob._initialize_session("alice", False)
 
+assert alice.initial_dh_sk is not None
+assert bob.initial_dh_sk is not None
 shared_a = alice.initial_dh_sk.exchange(
     ec.ECDH(), alice.certs["bob"]
 )
@@ -519,3 +522,64 @@ else:
     error("Recovered message decrypted using the old key")
 
 print("Step 10 break-in recovery tests passed!")
+
+
+def test_rejected_messages_do_not_change_state():
+    """Rejected first packets must not choose the session's role or retain keys."""
+    left = MessengerClient("left", server_sign_pk, server_enc_pk)
+    right = MessengerClient("right", server_sign_pk, server_enc_pk)
+    left_cert = left.generateCertificate()
+    right_cert = right.generateCertificate()
+    left.receiveCertificate(right_cert, server.signCert(right_cert))
+    right.receiveCertificate(left_cert, server.signCert(left_cert))
+
+    forged_header = {
+        "dh": right_cert["public_key"], "pn": 0, "n": 0, "nonce": "00" * 12,
+    }
+    # Valid shape and certified public key, but invalid authentication tag.
+    assert left.receiveMessage("right", forged_header, b"x" * 16) is None
+    assert left.conns == {}
+
+    for field, value in (("n", -1), ("n", True), ("pn", 1),
+                         ("nonce", "zz"), ("dh", "04" + "00" * 64)):
+        malformed = dict(forged_header)
+        malformed[field] = value
+        assert left.receiveMessage("right", malformed, b"x" * 16) is None
+        assert left.conns == {}
+
+    # Encoding failure must not create an outgoing session either.
+    try:
+        left.sendMessage("right", "\ud800")
+    except UnicodeEncodeError:
+        pass
+    else:
+        error("accepted invalid Unicode plaintext")
+    assert left.conns == {}
+
+    # Initiating in the opposite direction must still work after the forgery.
+    header, ciphertext = left.sendMessage("right", "Legitimate initiation")
+    assert right.receiveMessage("left", header, ciphertext) == "Legitimate initiation"
+    reply_header, reply_ct = right.sendMessage("left", "Legitimate reply")
+    before = left.conns["right"].copy()
+    corrupted = reply_ct[:-1] + bytes([reply_ct[-1] ^ 1])
+    assert left.receiveMessage("right", reply_header, corrupted) is None
+    assert left.conns["right"] == before
+    assert left.receiveMessage("right", reply_header, reply_ct) == "Legitimate reply"
+
+    # Out-of-order delivery is rejected without consuming the expected key.
+    first_header, first_ct = left.sendMessage("right", "First in order")
+    second_header, second_ct = left.sendMessage("right", "Second in order")
+    before = right.conns["left"].copy()
+    assert right.receiveMessage("left", second_header, second_ct) is None
+    assert right.conns["left"] == before
+    assert right.receiveMessage("left", first_header, first_ct) == "First in order"
+    assert right.receiveMessage("left", second_header, second_ct) == "Second in order"
+
+    # Returned certificates must not expose the internal mutable dictionary.
+    changed = left.generateCertificate()
+    changed["name"] = "tampered"
+    assert left.generateCertificate() == left_cert
+
+
+test_rejected_messages_do_not_change_state()
+print("Atomic session initialization and rejection regression tests passed!")
